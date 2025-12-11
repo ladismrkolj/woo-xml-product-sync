@@ -155,7 +155,7 @@ function wxps_sync_products(bool $dry_run = false): void
             $product->set_stock_status($in_stock ? 'instock' : 'outofstock');
 
             if (! empty($image_urls)) {
-                wxps_attach_images($product, $image_urls);
+                //wxps_attach_images($product, $image_urls);
             }
 
             $product->save();
