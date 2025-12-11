@@ -11,6 +11,24 @@ if (! defined('ABSPATH')) {
 }
 
 /**
+ * Generate or retrieve the sync token.
+ */
+function wxps_get_or_create_token(): string
+{
+    $token = get_option('wxps_sync_token');
+    if (! $token) {
+        $token = bin2hex(random_bytes(32));
+        update_option('wxps_sync_token', $token);
+    }
+    return $token;
+}
+
+// Initialize token on plugin activation
+register_activation_hook(__FILE__, function () {
+    wxps_get_or_create_token();
+});
+
+/**
  * Entry point for manual sync triggers.
  */
 function wxps_maybe_run_sync(): void
@@ -19,8 +37,17 @@ function wxps_maybe_run_sync(): void
         return;
     }
 
+    // Ensure token exists
+    $token = wxps_get_or_create_token();
+
+    // Validate token
+    if (! isset($_GET['token']) || $_GET['token'] !== $token) {
+        echo '[wxps] Error: Invalid or missing token';
+        return;
+    }
+
     if (! class_exists('WooCommerce')) {
-        error_log('[wxps] WooCommerce is not active.');
+        echo '[wxps] Error: WooCommerce is not active.';
         return;
     }
 
@@ -40,13 +67,13 @@ function wxps_sync_products(bool $dry_run = false): void
     $response = wp_remote_get($feed_url);
 
     if (is_wp_error($response)) {
-        error_log('[wxps] Failed to fetch XML feed: ' . $response->get_error_message());
+        echo '[wxps] Error: Failed to fetch XML feed: ' . $response->get_error_message();
         return;
     }
 
     $status = wp_remote_retrieve_response_code($response);
     if ($status !== 200) {
-        error_log('[wxps] Unexpected response code: ' . $status);
+        echo '[wxps] Error: Unexpected response code: ' . $status;
         return;
     }
 
@@ -54,12 +81,12 @@ function wxps_sync_products(bool $dry_run = false): void
     $xml = simplexml_load_string($body, 'SimpleXMLElement', LIBXML_NOCDATA);
 
     if ($xml === false) {
-        error_log('[wxps] Failed to parse XML feed.');
+        echo '[wxps] Error: Failed to parse XML feed.';
         return;
     }
 
     if (! isset($xml->izdelki->izdelek)) {
-        error_log('[wxps] No products found in XML feed.');
+        echo '[wxps] Error: No products found in XML feed.';
         return;
     }
 
@@ -69,7 +96,7 @@ function wxps_sync_products(bool $dry_run = false): void
         $external_id = trim((string) ($item->izdelekID ?? ''));
 
         if ($external_id === '') {
-            error_log('[wxps] Skipping product with missing external ID.');
+            echo '[wxps] Warning: Skipping product with missing external ID.';
             continue;
         }
 
@@ -79,6 +106,7 @@ function wxps_sync_products(bool $dry_run = false): void
         $price       = wxps_normalize_price((string) ($item->PPC ?? ''));
         $image_urls  = wxps_collect_images($item);
         $in_stock    = wxps_is_in_stock($item->dobava ?? null);
+        $brand       = trim((string) ($item->blagovnaZnamka ?? ''));
 
         $feed_skus[] = $sku;
 
@@ -97,12 +125,14 @@ function wxps_sync_products(bool $dry_run = false): void
                 $sku,
                 $price,
                 $in_stock,
-                $image_urls
+                $image_urls,
+                $brand
             );
 
             if ($product_id) {
                 update_post_meta($product_id, '_from_xml_feed', 'yes');
                 update_post_meta($product_id, '_external_id', $external_id);
+                wp_add_object_terms($product_id, 'new', 'product_tag');
             }
 
             continue;
@@ -112,7 +142,7 @@ function wxps_sync_products(bool $dry_run = false): void
 
         $product = wc_get_product($existing_id);
         if (! $product) {
-            error_log('[wxps] Could not load product with ID ' . $existing_id . ' for SKU ' . $sku);
+            echo '[wxps] Error: Could not load product with ID ' . $existing_id . ' for SKU ' . $sku;
             continue;
         }
 
@@ -179,19 +209,20 @@ function wxps_create_product(
     string $sku,
     float $price,
     bool $in_stock,
-    array $image_urls
+    array $image_urls,
+    string $brand = ''
 ): int {
     $product_args = [
         'post_title'   => $name,
         'post_content' => $description,
-        'post_status'  => 'draft',
+        'post_status'  => 'pending',
         'post_type'    => 'product',
     ];
 
     $product_id = wp_insert_post($product_args);
 
     if (is_wp_error($product_id) || ! $product_id) {
-        error_log('[wxps] Failed to create product for SKU ' . $sku);
+        echo '[wxps] Error: Failed to create product for SKU ' . $sku;
         return 0;
     }
 
@@ -199,7 +230,7 @@ function wxps_create_product(
 
     $product = wc_get_product($product_id);
     if (! $product) {
-        error_log('[wxps] Failed to load created product for SKU ' . $sku);
+        echo '[wxps] Error: Failed to load created product for SKU ' . $sku;
         return 0;
     }
 
@@ -208,6 +239,12 @@ function wxps_create_product(
     $product->set_stock_status($in_stock ? 'instock' : 'outofstock');
     $product->set_regular_price($price);
     $product->set_price($price);
+
+    if (! empty($brand)) {
+        $product->set_attributes([
+            'pa_brand' => $brand,
+        ]);
+    }
 
     if (! empty($image_urls)) {
         wxps_attach_images($product, $image_urls);
@@ -324,7 +361,7 @@ function wxps_media_sideload_image(string $url): int
     $attachment_id = media_sideload_image($url, 0, null, 'id');
 
     if (is_wp_error($attachment_id)) {
-        error_log('[wxps] Failed to sideload image: ' . $attachment_id->get_error_message());
+        echo '[wxps] Error: Failed to sideload image: ' . $attachment_id->get_error_message();
         return 0;
     }
 
@@ -363,28 +400,15 @@ function wxps_handle_missing_feed_products(array $feed_skus, bool $dry_run = fal
         $in_feed = in_array($sku, $feed_skus, true);
 
         if (! $in_feed) {
-            wxps_log(sprintf('[wxps] Marking product ID %d (SKU %s) as missing from feed', $product_id, $sku), $dry_run);
+            wxps_log(sprintf('[wxps] Deleting product ID %d (SKU %s) missing from feed', $product_id, $sku), $dry_run);
 
             if ($dry_run) {
                 continue;
             }
 
-            wp_update_post([
-                'ID'          => $product_id,
-                'post_status' => 'draft',
-            ]);
-
-            wp_add_object_terms($product_id, 'not-in-xml-feed', 'product_tag');
-            update_post_meta($product_id, '_not_in_xml_feed', 'yes');
+            wp_delete_post($product_id, true);
         } else {
-            wxps_log(sprintf('[wxps] Product ID %d (SKU %s) present in feed; removing missing markers', $product_id, $sku), $dry_run);
-
-            if ($dry_run) {
-                continue;
-            }
-
-            delete_post_meta($product_id, '_not_in_xml_feed');
-            wp_remove_object_terms($product_id, 'not-in-xml-feed', 'product_tag');
+            wxps_log(sprintf('[wxps] Product ID %d (SKU %s) present in feed', $product_id, $sku), $dry_run);
         }
     }
 }
