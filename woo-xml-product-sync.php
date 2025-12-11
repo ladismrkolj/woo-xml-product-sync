@@ -123,6 +123,11 @@ function wxps_sync_products(bool $dry_run = false): void
             // $product->set_price($price);
             $product->set_manage_stock(false);
             $product->set_stock_status($in_stock ? 'instock' : 'outofstock');
+
+            if (! empty($image_urls)) {
+                wxps_attach_images($product, $image_urls);
+            }
+
             $product->save();
 
             update_post_meta($existing_id, '_from_xml_feed', 'yes');
@@ -143,20 +148,21 @@ function wxps_is_in_stock($dobava): bool
     }
 
     $id   = isset($dobava['id']) ? trim((string) $dobava['id']) : '';
-    $text = strtolower(trim((string) $dobava));
+    $text = trim((string) $dobava);
+    $normalized_text = strtolower($text);
 
     if ($id !== '' && $id !== '0') {
         return true;
     }
 
-    if ($text === '') {
+    if ($normalized_text === '') {
         return false;
     }
 
     $in_stock_phrases = ['na zalogi', 'zaloga', 'na voljo'];
 
     foreach ($in_stock_phrases as $phrase) {
-        if (strpos($text, $phrase) !== false) {
+        if (strpos($normalized_text, $phrase) !== false) {
             return true;
         }
     }
@@ -278,7 +284,9 @@ function wxps_collect_images(SimpleXMLElement $item): array
  */
 function wxps_attach_images(WC_Product $product, array $image_urls): void
 {
-    foreach ($image_urls as $index => $url) {
+    $new_attachment_ids = [];
+
+    foreach ($image_urls as $url) {
         if ($url === '') {
             continue;
         }
@@ -289,14 +297,17 @@ function wxps_attach_images(WC_Product $product, array $image_urls): void
             continue;
         }
 
-        if ($index === 0) {
-            $product->set_image_id($attachment_id);
-        } else {
-            $gallery_ids   = $product->get_gallery_image_ids();
-            $gallery_ids[] = $attachment_id;
-            $product->set_gallery_image_ids(array_unique($gallery_ids));
-        }
+        $new_attachment_ids[] = $attachment_id;
     }
+
+    if (empty($new_attachment_ids)) {
+        return;
+    }
+
+    $primary_id = array_shift($new_attachment_ids);
+
+    $product->set_image_id($primary_id);
+    $product->set_gallery_image_ids($new_attachment_ids);
 }
 
 /**
