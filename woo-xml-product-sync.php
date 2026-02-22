@@ -23,10 +23,30 @@ function wxps_get_or_create_token(): string
     return $token;
 }
 
-// Initialize token on plugin activation
-register_activation_hook(__FILE__, function () {
+/**
+ * Setup plugin defaults and cron event.
+ */
+function wxps_activate_plugin(): void
+{
     wxps_get_or_create_token();
-});
+
+    if (! wp_next_scheduled('wxps_cron_sync_event')) {
+        wp_schedule_event(time(), 'hourly', 'wxps_cron_sync_event');
+    }
+}
+register_activation_hook(__FILE__, 'wxps_activate_plugin');
+
+/**
+ * Remove cron event on deactivation.
+ */
+function wxps_deactivate_plugin(): void
+{
+    $timestamp = wp_next_scheduled('wxps_cron_sync_event');
+    if ($timestamp) {
+        wp_unschedule_event($timestamp, 'wxps_cron_sync_event');
+    }
+}
+register_deactivation_hook(__FILE__, 'wxps_deactivate_plugin');
 
 /**
  * Entry point for manual sync triggers.
@@ -53,28 +73,131 @@ function wxps_maybe_run_sync(): void
 
     $dry_run = isset($_GET['dryrun']) && '1' === $_GET['dryrun'];
 
-    wxps_sync_products($dry_run);
+    $report = wxps_sync_products($dry_run, 'manual');
+    wxps_log(
+        sprintf(
+            'Manual sync finished. Created: %d, Updated: %d, Deleted: %d, Skipped: %d, Errors: %d',
+            $report['created'],
+            $report['updated'],
+            $report['deleted'],
+            $report['skipped'],
+            $report['errors']
+        ),
+        $dry_run
+    );
 }
 add_action('init', 'wxps_maybe_run_sync');
 
 /**
+ * Run sync through WP-Cron.
+ */
+function wxps_run_cron_sync(): void
+{
+    if (! class_exists('WooCommerce')) {
+        wxps_log('Cron sync skipped because WooCommerce is not active.');
+        return;
+    }
+
+    wxps_log('Cron sync started.');
+
+    $report = wxps_sync_products(false, 'cron');
+
+    wxps_log(
+        sprintf(
+            'Cron sync finished. Created: %d, Updated: %d, Deleted: %d, Skipped: %d, Errors: %d',
+            $report['created'],
+            $report['updated'],
+            $report['deleted'],
+            $report['skipped'],
+            $report['errors']
+        )
+    );
+}
+add_action('wxps_cron_sync_event', 'wxps_run_cron_sync');
+
+/**
+ * Register tools page for sync logs.
+ */
+function wxps_register_admin_page(): void
+{
+    add_management_page(
+        'Woo XML Product Sync Logs',
+        'Woo XML Sync Logs',
+        'manage_options',
+        'wxps-logs',
+        'wxps_render_logs_page'
+    );
+}
+add_action('admin_menu', 'wxps_register_admin_page');
+
+/**
+ * Render plugin logs page.
+ */
+function wxps_render_logs_page(): void
+{
+    if (! current_user_can('manage_options')) {
+        return;
+    }
+
+    if (isset($_POST['wxps_clear_logs']) && check_admin_referer('wxps_clear_logs_action')) {
+        update_option('wxps_sync_logs', []);
+        echo '<div class="notice notice-success"><p>Logs cleared.</p></div>';
+    }
+
+    $logs = get_option('wxps_sync_logs', []);
+
+    echo '<div class="wrap">';
+    echo '<h1>Woo XML Product Sync Logs</h1>';
+    echo '<p>Recent sync activity from manual and cron runs.</p>';
+
+    echo '<form method="post" style="margin-bottom: 16px;">';
+    wp_nonce_field('wxps_clear_logs_action');
+    submit_button('Clear Logs', 'delete', 'wxps_clear_logs', false);
+    echo '</form>';
+
+    if (empty($logs)) {
+        echo '<p>No log entries yet.</p>';
+        echo '</div>';
+        return;
+    }
+
+    echo '<pre style="max-height: 500px; overflow: auto; background: #fff; border: 1px solid #ccd0d4; padding: 12px;">';
+    foreach ($logs as $line) {
+        echo esc_html($line) . "\n";
+    }
+    echo '</pre>';
+    echo '</div>';
+}
+
+/**
  * Perform the product synchronization.
  */
-function wxps_sync_products(bool $dry_run = false): void
+function wxps_sync_products(bool $dry_run = false, string $source = 'manual'): array
 {
+    $report = [
+        'source'  => $source,
+        'created' => 0,
+        'updated' => 0,
+        'deleted' => 0,
+        'skipped' => 0,
+        'errors'  => 0,
+    ];
+
     $feed_url = 'https://www.recharge.si/export.php?ceID=6';
 
     $response = wp_remote_get($feed_url);
 
     if (is_wp_error($response)) {
         echo '[wxps] Error: Failed to fetch XML feed: ' . $response->get_error_message();
-        return;
+        $report['errors']++;
+        return $report;
     }
 
     $status = wp_remote_retrieve_response_code($response);
     if ($status !== 200) {
         echo '[wxps] Error: Unexpected response code: ' . $status;
-        return;
+        $report['errors']++;
+        return $report;
     }
 
     $body = wp_remote_retrieve_body($response);
@@ -82,12 +205,14 @@ function wxps_sync_products(bool $dry_run = false): void
 
     if ($xml === false) {
         echo '[wxps] Error: Failed to parse XML feed.';
-        return;
+        $report['errors']++;
+        return $report;
     }
 
     if (! isset($xml->izdelki->izdelek)) {
         echo '[wxps] Error: No products found in XML feed.';
-        return;
+        $report['errors']++;
+        return $report;
     }
 
     $feed_skus = [];
@@ -97,6 +222,7 @@ function wxps_sync_products(bool $dry_run = false): void
 
         if ($external_id === '') {
             echo '[wxps] Warning: Skipping product with missing external ID.';
+            $report['skipped']++;
             continue;
         }
 
@@ -116,6 +242,7 @@ function wxps_sync_products(bool $dry_run = false): void
             wxps_log(sprintf('[wxps] Creating product for SKU %s', $sku), $dry_run);
 
             if ($dry_run) {
+                $report['skipped']++;
                 continue;
             }
 
@@ -130,9 +257,12 @@ function wxps_sync_products(bool $dry_run = false): void
             );
 
             if ($product_id) {
+                $report['created']++;
                 update_post_meta($product_id, '_from_xml_feed', 'yes');
                 update_post_meta($product_id, '_external_id', $external_id);
                 wp_add_object_terms($product_id, 'new', 'product_tag');
+            } else {
+                $report['errors']++;
             }
 
             continue;
@@ -143,6 +273,7 @@ function wxps_sync_products(bool $dry_run = false): void
         $product = wc_get_product($existing_id);
         if (! $product) {
             echo '[wxps] Error: Could not load product with ID ' . $existing_id . ' for SKU ' . $sku;
+            $report['errors']++;
             continue;
         }
 
@@ -159,13 +290,16 @@ function wxps_sync_products(bool $dry_run = false): void
             }
 
             $product->save();
+            $report['updated']++;
 
             update_post_meta($existing_id, '_from_xml_feed', 'yes');
             update_post_meta($existing_id, '_external_id', $external_id);
         }
     }
 
-    wxps_handle_missing_feed_products($feed_skus, $dry_run);
+    wxps_handle_missing_feed_products($feed_skus, $dry_run, $report);
+
+    return $report;
 }
 
 /**
@@ -371,7 +505,7 @@ function wxps_media_sideload_image(string $url): int
 /**
  * Handle products missing from the current feed.
  */
-function wxps_handle_missing_feed_products(array $feed_skus, bool $dry_run = false): void
+function wxps_handle_missing_feed_products(array $feed_skus, bool $dry_run = false, array &$report = []): void
 {
     $query = new WP_Query([
         'post_type'      => 'product',
@@ -403,10 +537,16 @@ function wxps_handle_missing_feed_products(array $feed_skus, bool $dry_run = fal
             wxps_log(sprintf('[wxps] Deleting product ID %d (SKU %s) missing from feed', $product_id, $sku), $dry_run);
 
             if ($dry_run) {
+                if (isset($report['skipped'])) {
+                    $report['skipped']++;
+                }
                 continue;
             }
 
             wp_delete_post($product_id, true);
+            if (isset($report['deleted'])) {
+                $report['deleted']++;
+            }
         } else {
             wxps_log(sprintf('[wxps] Product ID %d (SKU %s) present in feed', $product_id, $sku), $dry_run);
         }
@@ -419,5 +559,20 @@ function wxps_handle_missing_feed_products(array $feed_skus, bool $dry_run = fal
 function wxps_log(string $message, bool $dry_run = false): void
 {
     $prefix = $dry_run ? '[wxps][dry-run] ' : '[wxps] ';
-    error_log($prefix . $message);
+    $line   = sprintf('[%s] %s%s', current_time('mysql'), $prefix, $message);
+
+    error_log($line);
+
+    $logs = get_option('wxps_sync_logs', []);
+    if (! is_array($logs)) {
+        $logs = [];
+    }
+
+    $logs[] = $line;
+
+    if (count($logs) > 200) {
+        $logs = array_slice($logs, -200);
+    }
+
+    update_option('wxps_sync_logs', $logs);
 }
